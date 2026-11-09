@@ -1,0 +1,18 @@
+from faststream import FastStream
+from faststream.redis import RedisBroker
+
+broker = RedisBroker()
+app = FastStream(broker)
+
+
+@broker.subscriber("my-subject")
+async def handler(msg: dict) -> None:
+    print(f"Received: {msg}")
+
+
+@app.on_startup
+async def startup(worker_id: int | None) -> None:
+    if worker_id is None:
+        print("Started in a single process")
+    else:
+        print(f"Worker {worker_id} started")

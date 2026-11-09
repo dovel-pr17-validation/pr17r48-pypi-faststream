@@ -1,0 +1,247 @@
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeAlias, Union
+
+from typing_extensions import TypeVar as TypeVar313
+
+from faststream._internal.constants import EMPTY
+from faststream._internal.di import FastDependsConfig
+from faststream._internal.logger import LoggerState
+from faststream._internal.producer import ProducerProto, ProducerUnset
+from faststream._internal.types import IdGenerator
+from faststream.message import gen_cor_id
+
+if TYPE_CHECKING:
+    from fast_depends.dependencies import Dependant
+
+    from faststream._internal.context import ContextRepo
+    from faststream._internal.parser import CodecProto
+    from faststream._internal.types import BrokerMiddleware, CustomCallable
+    from faststream.middlewares import AckPolicy
+
+
+@dataclass(kw_only=True, slots=True)
+class UnderlyingDriverAnnotation:
+    """A driver class mapped to the context annotation that injects it.
+
+    Attributes:
+        type_hint: the context annotation to use instead.
+        module: where that annotation is importable from.
+        name: its name in that module.
+    """
+
+    type_hint: Any
+    module: str
+    name: str
+
+
+UnderlyingDriverAnnotations: TypeAlias = Mapping[Any, UnderlyingDriverAnnotation | Any]
+
+
+@dataclass(kw_only=True)
+class BrokerConfig:
+    prefix: str = ""
+    include_in_schema: bool | None = True
+
+    broker_middlewares: Sequence["BrokerMiddleware[Any]"] = ()
+    broker_parser: Optional["CustomCallable"] = None
+    broker_decoder: Optional["CustomCallable"] = None
+    broker_codec: Optional["CodecProto"] = None
+
+    producer: "ProducerProto[Any]" = field(default_factory=ProducerUnset)
+    logger: "LoggerState" = field(default_factory=LoggerState)
+    fd_config: "FastDependsConfig" = field(default_factory=FastDependsConfig)
+    id_generator: IdGenerator = gen_cor_id
+
+    # subscriber options
+    underlying_driver_annotations: UnderlyingDriverAnnotations = field(
+        default_factory=dict
+    )
+    default_driver_annotations: UnderlyingDriverAnnotations = field(default_factory=dict)
+    broker_dependencies: Sequence["Dependant"] = ()
+    graceful_timeout: float | None = 15.0
+    ack_policy: "AckPolicy" = field(default_factory=lambda: EMPTY)
+    extra_context: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # untyped callers still pass a generator: the first subscriber would spend it
+        self.broker_dependencies = tuple(self.broker_dependencies)
+
+    @property
+    def resolved_underlying_driver_annotations(
+        self,
+    ) -> UnderlyingDriverAnnotations:
+        # A broker's own rows are the defaults; anything the user passed wins.
+        return {
+            **self.default_driver_annotations,
+            **self.underlying_driver_annotations,
+        }
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(id: {id(self)})"
+
+    def __bool__(self) -> bool:
+        return bool(
+            self.include_in_schema is not None
+            or self.broker_middlewares
+            or self.broker_dependencies
+            or self.prefix,
+        )
+
+    @property
+    def context(self) -> "ContextRepo":
+        return self.fd_config.context
+
+    def add_middleware(self, middleware: "BrokerMiddleware[Any]") -> None:
+        self.broker_middlewares = (*self.broker_middlewares, middleware)
+
+    def insert_middleware(self, middleware: "BrokerMiddleware[Any]") -> None:
+        self.broker_middlewares = (middleware, *self.broker_middlewares)
+
+
+BrokerConfigType_co = TypeVar313(
+    "BrokerConfigType_co",
+    bound=BrokerConfig,
+    default=BrokerConfig,
+    covariant=True,
+)
+
+ConfigType = Union["ConfigComposition[Any]", "BrokerConfigType_co", BrokerConfig]
+
+
+class ConfigComposition(Generic[BrokerConfigType_co]):  # ruff: ignore[too-many-public-methods]
+    def __init__(self, config: BrokerConfigType_co) -> None:
+        self.configs: tuple[ConfigType[BrokerConfigType_co], ...] = (config,)
+
+    @property
+    def broker_config(self) -> "BrokerConfigType_co":
+        assert self.configs
+        return self.configs[0]  # type: ignore[return-value]
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({', '.join(repr(c) for c in self.configs)})"
+
+    def add_config(self, config: "ConfigType[BrokerConfigType_co]") -> None:
+        self.configs = (config, *self.configs)
+
+    def reset(self) -> None:
+        self.configs = (self.configs[-1],)
+
+    # broker priority options
+    @property
+    def producer(self) -> "ProducerProto[Any]":
+        return self.broker_config.producer
+
+    @property
+    def logger(self) -> "LoggerState":
+        return self.broker_config.logger
+
+    @property
+    def fd_config(self) -> "FastDependsConfig":
+        return self.broker_config.fd_config
+
+    @fd_config.setter
+    def fd_config(self, value: "FastDependsConfig") -> None:
+        self.broker_config.fd_config = value
+
+    @property
+    def context(self) -> "ContextRepo":
+        return self.broker_config.context
+
+    @property
+    def graceful_timeout(self) -> float | None:
+        return self.broker_config.graceful_timeout
+
+    @property
+    def id_generator(self) -> IdGenerator:
+        return self.broker_config.id_generator
+
+    def add_middleware(self, middleware: "BrokerMiddleware[Any]") -> None:
+        self.broker_config.add_middleware(middleware)
+
+    def insert_middleware(self, middleware: "BrokerMiddleware[Any]") -> None:
+        self.broker_config.insert_middleware(middleware)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.broker_config, name)
+
+    # first valuable option
+    @property
+    def broker_parser(self) -> Optional["CustomCallable"]:
+        for c in self.configs:
+            if c.broker_parser:
+                return c.broker_parser
+        return None
+
+    @property
+    def broker_decoder(self) -> Optional["CustomCallable"]:
+        for c in self.configs:
+            if c.broker_decoder:
+                return c.broker_decoder
+        return None
+
+    @property
+    def broker_codec(self) -> Optional["CodecProto"]:
+        for c in self.configs:
+            if c.broker_codec:
+                return c.broker_codec
+        return None
+
+    @property
+    def ack_policy(self) -> "AckPolicy":
+        for c in reversed(self.configs):
+            ack = c.ack_policy
+            if ack is not EMPTY:
+                return ack
+        return EMPTY  # type: ignore[no-any-return]
+
+    # merged options
+    @property
+    def extra_context(self) -> dict[str, Any]:
+        context: dict[str, Any] = {}
+        for c in self.configs:
+            context |= c.extra_context
+        return context
+
+    @property
+    def underlying_driver_annotations(
+        self,
+    ) -> UnderlyingDriverAnnotations:
+        annotations: dict[Any, Any] = {}
+        for c in self.configs:
+            annotations |= c.underlying_driver_annotations
+        return annotations
+
+    @property
+    def default_driver_annotations(
+        self,
+    ) -> UnderlyingDriverAnnotations:
+        annotations: dict[Any, Any] = {}
+        for c in self.configs:
+            annotations |= c.default_driver_annotations
+        return annotations
+
+    @property
+    def resolved_underlying_driver_annotations(
+        self,
+    ) -> UnderlyingDriverAnnotations:
+        return {
+            **self.default_driver_annotations,
+            **self.underlying_driver_annotations,
+        }
+
+    @property
+    def prefix(self) -> str:
+        return "".join(c.prefix for c in self.configs)
+
+    @property
+    def include_in_schema(self) -> bool:
+        return all(c.include_in_schema is not False for c in self.configs)
+
+    @property
+    def broker_middlewares(self) -> Sequence["BrokerMiddleware[Any]"]:
+        return [m for c in self.configs for m in c.broker_middlewares]
+
+    @property
+    def broker_dependencies(self) -> Sequence["Dependant"]:
+        return [b for c in self.configs for b in c.broker_dependencies]

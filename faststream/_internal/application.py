@@ -1,0 +1,377 @@
+import logging
+from abc import abstractmethod
+from collections.abc import AsyncGenerator, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
+from typing import TYPE_CHECKING, Any, Optional, TypeVar
+
+from typing_extensions import ParamSpec, Self, deprecated
+
+from faststream._internal.di import FastDependsConfig
+from faststream._internal.logger import logger
+from faststream._internal.utils import apply_types
+from faststream._internal.utils.functions import to_async
+from faststream.exceptions import SetupError
+from faststream.specification import AsyncAPI
+
+if TYPE_CHECKING:
+    from types import TracebackType
+
+    from faststream._internal.basic_types import (
+        AnyCallable,
+        AsyncFunc,
+        Lifespan,
+        LoggerProto,
+        SettingField,
+    )
+    from faststream._internal.broker import BrokerUsecase
+    from faststream._internal.context import ContextRepo
+    from faststream.specification.base import SpecificationFactory
+
+
+catch_startup_validation_error: Callable[[], AbstractAsyncContextManager[Any, Any]]
+
+try:
+    from pydantic import ValidationError as PValidation
+
+    from faststream.exceptions import StartupValidationError
+
+    @asynccontextmanager
+    async def catch_startup_validation_error() -> AsyncGenerator[None, None]:
+        try:
+            yield
+        except PValidation as e:
+            missed_fields = []
+            invalid_fields = []
+            for x in e.errors():
+                location = str(x["loc"][0])
+                if x["type"] == "missing":
+                    missed_fields.append(location)
+                else:
+                    invalid_fields.append(location)
+
+            raise StartupValidationError(
+                missed_fields=missed_fields,
+                invalid_fields=invalid_fields,
+            ) from e
+
+except ImportError:  # pragma: no cover
+    catch_startup_validation_error = nullcontext
+
+
+P_HookParams = ParamSpec("P_HookParams")
+T_HookReturn = TypeVar("T_HookReturn")
+
+
+class StartAbleApplication:
+    __slots__ = (
+        "brokers",
+        "config",
+        "schema",
+    )
+
+    def __init__(
+        self,
+        *brokers: "BrokerUsecase[Any, Any, Any]",
+        specification: Optional["SpecificationFactory"] = None,
+        config: Optional["FastDependsConfig"] = None,
+    ) -> None:
+        self._init_setupable_(
+            *brokers,
+            config=config,
+            specification=specification,
+        )
+
+    @property
+    def context(self) -> "ContextRepo":
+        return self.config.context
+
+    def _init_setupable_(  # ruff: ignore[bad-dunder-method-name]
+        self,
+        *brokers: "BrokerUsecase[Any, Any, Any]",
+        specification: Optional["SpecificationFactory"] = None,
+        config: Optional["FastDependsConfig"] = None,
+    ) -> None:
+        self.config = config or FastDependsConfig()
+        self.config.context.set_global("app", self)
+        self.brokers: list[BrokerUsecase[Any, Any, Any]] = []
+
+        self.schema: SpecificationFactory = specification or AsyncAPI()
+
+        for br in brokers:
+            self.add_broker(br)
+
+    async def _start_broker(self) -> None:
+        assert self.brokers, "You should setup a broker"
+        for b in self.brokers:
+            await b.start()
+
+    @property
+    def broker(self) -> Optional["BrokerUsecase[Any, Any, Any]"]:
+        return self.brokers[0] if self.brokers else None
+
+    @deprecated(
+        "This method is deprecated and will be removed in 0.8.0 Use `add_broker` instead."
+    )
+    def set_broker(self, broker: "BrokerUsecase[Any, Any, Any]") -> None:
+        """Set already existed App object broker.
+
+        Useful then you create/init broker in `on_startup` hook.
+        """
+        self.add_broker(broker)
+
+    def add_broker(self, broker: "BrokerUsecase[Any, Any, Any]") -> None:
+        if broker in self.brokers:
+            msg = f"Broker {broker} is already added"
+            raise SetupError(msg)
+
+        self.brokers.append(broker)
+        self.schema.add_broker(broker)
+        broker._update_fd_config(self.config)
+
+
+class Application(StartAbleApplication):
+    """Unslotted on purpose: an application object is the user's own.
+
+    One exists per process, so slots would save nothing, and user code and our own
+    CLI tests assign to it (`app.run` is patched in `tests/cli/test_logs.py`).
+    """
+
+    def __init__(
+        self,
+        *brokers: "BrokerUsecase[Any, Any, Any]",
+        config: Optional["FastDependsConfig"] = None,
+        logger: Optional["LoggerProto"] = logger,
+        lifespan: Optional["Lifespan"] = None,
+        on_startup: Sequence["AnyCallable"] = (),
+        after_startup: Sequence["AnyCallable"] = (),
+        on_shutdown: Sequence["AnyCallable"] = (),
+        after_shutdown: Sequence["AnyCallable"] = (),
+        specification: Optional["SpecificationFactory"] = None,
+    ) -> None:
+        self.logger = logger
+
+        super().__init__(*brokers, config=config, specification=specification)
+
+        self._on_startup_calling: list[AsyncFunc] = [
+            apply_types(
+                to_async(x),
+                serializer_cls=self.config._serializer,
+                context__=self.context,
+            )
+            for x in on_startup
+        ]
+        self._after_startup_calling: list[AsyncFunc] = [
+            apply_types(
+                to_async(x),
+                serializer_cls=self.config._serializer,
+                context__=self.context,
+            )
+            for x in after_startup
+        ]
+        self._on_shutdown_calling: list[AsyncFunc] = [
+            apply_types(
+                to_async(x),
+                serializer_cls=self.config._serializer,
+                context__=self.context,
+            )
+            for x in on_shutdown
+        ]
+        self._after_shutdown_calling: list[AsyncFunc] = [
+            apply_types(
+                to_async(x),
+                serializer_cls=self.config._serializer,
+                context__=self.context,
+            )
+            for x in after_shutdown
+        ]
+
+        if lifespan:
+            self.lifespan_context = apply_types(
+                func=lifespan,
+                serializer_cls=self.config._serializer,
+                cast_result=False,
+                context__=self.context,
+            )
+        else:
+            self.lifespan_context = lambda *_, **__: nullcontext()
+
+    async def __aenter__(self) -> Self:
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_val: BaseException | None = None,
+        exc_tb: Optional["TracebackType"] = None,
+    ) -> None:
+        await self.stop()
+
+    @abstractmethod
+    def exit(self) -> None:
+        """Stop application manually."""
+        ...
+
+    @abstractmethod
+    async def run(
+        self,
+        log_level: int,
+        run_extra_options: dict[str, "SettingField"] | None = None,
+    ) -> None: ...
+
+    # Startup
+
+    async def _startup(
+        self,
+        log_level: int = logging.INFO,
+        run_extra_options: dict[str, "SettingField"] | None = None,
+    ) -> None:
+        """Private method calls `start` with logging."""
+        async with self._startup_logging(log_level=log_level):
+            await self.start(**(run_extra_options or {}))
+
+        self.running = True
+
+    async def start(
+        self,
+        **run_extra_options: "SettingField",
+    ) -> None:
+        """Executes startup hooks and start broker."""
+        async with self._start_hooks_context(**run_extra_options):
+            await self._start_broker()
+
+    @asynccontextmanager
+    async def _start_hooks_context(
+        self,
+        **run_extra_options: "SettingField",
+    ) -> AsyncGenerator[None, None]:
+        async with catch_startup_validation_error():
+            for func in self._on_startup_calling:
+                await func(**run_extra_options)
+
+        yield  # ruff: ignore[fallible-context-manager]
+
+        for func in self._after_startup_calling:
+            await func()
+
+    @asynccontextmanager
+    async def _startup_logging(
+        self,
+        log_level: int = logging.INFO,
+    ) -> AsyncGenerator[None, None]:
+        """Separated startup logging."""
+        self._log(
+            log_level,
+            "FastStream app starting...",
+        )
+
+        yield  # ruff: ignore[fallible-context-manager]
+
+        self._log(
+            log_level,
+            "FastStream app started successfully! To exit, press CTRL+C",
+        )
+
+    # Shutdown
+
+    async def _shutdown(self, log_level: int = logging.INFO) -> None:
+        """Private method calls `stop` with logging."""
+        async with self._shutdown_logging(log_level=log_level):
+            await self.stop()
+
+        self.running = False
+
+    async def stop(self) -> None:
+        """Executes shutdown hooks and stop broker."""
+        async with self._shutdown_hooks_context():
+            for broker in self.brokers:
+                await broker.stop()
+
+    @asynccontextmanager
+    async def _shutdown_hooks_context(self) -> AsyncGenerator[None, None]:
+        for func in self._on_shutdown_calling:
+            await func()
+
+        yield  # ruff: ignore[fallible-context-manager]
+
+        for func in self._after_shutdown_calling:
+            await func()
+
+    @asynccontextmanager
+    async def _shutdown_logging(
+        self,
+        log_level: int = logging.INFO,
+    ) -> AsyncGenerator[None, None]:
+        """Separated startup logging."""
+        self._log(log_level, "FastStream app shutting down...")
+
+        yield  # ruff: ignore[fallible-context-manager]
+
+        self._log(log_level, "FastStream app shut down gracefully.")
+
+    # Service methods
+
+    def _log(self, level: int, message: str) -> None:
+        if self.logger is not None:
+            self.logger.log(level, message)
+
+    # Hooks
+
+    def on_startup(
+        self,
+        func: Callable[P_HookParams, T_HookReturn],
+    ) -> Callable[P_HookParams, T_HookReturn]:
+        """Add hook running BEFORE broker connected.
+
+        This hook also takes an extra CLI options as a kwargs.
+        """
+        self._on_startup_calling.append(
+            apply_types(
+                to_async(func),
+                serializer_cls=self.config._serializer,
+                context__=self.context,
+            ),
+        )
+        return func
+
+    def on_shutdown(
+        self,
+        func: Callable[P_HookParams, T_HookReturn],
+    ) -> Callable[P_HookParams, T_HookReturn]:
+        """Add hook running BEFORE broker disconnected."""
+        self._on_shutdown_calling.append(
+            apply_types(
+                to_async(func),
+                serializer_cls=self.config._serializer,
+                context__=self.context,
+            ),
+        )
+        return func
+
+    def after_startup(
+        self,
+        func: Callable[P_HookParams, T_HookReturn],
+    ) -> Callable[P_HookParams, T_HookReturn]:
+        """Add hook running AFTER broker connected."""
+        self._after_startup_calling.append(
+            apply_types(
+                to_async(func),
+                serializer_cls=self.config._serializer,
+                context__=self.context,
+            ),
+        )
+        return func
+
+    def after_shutdown(
+        self,
+        func: Callable[P_HookParams, T_HookReturn],
+    ) -> Callable[P_HookParams, T_HookReturn]:
+        """Add hook running AFTER broker disconnected."""
+        self._after_shutdown_calling.append(
+            apply_types(
+                to_async(func),
+                serializer_cls=self.config._serializer,
+                context__=self.context,
+            ),
+        )
+        return func

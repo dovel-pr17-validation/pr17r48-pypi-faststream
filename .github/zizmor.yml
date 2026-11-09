@@ -1,0 +1,4 @@
+rules:
+  use-trusted-publishing: # Remove this section after PyPI Trusted Publisher setup
+    ignore:
+      - release_pypi.yaml

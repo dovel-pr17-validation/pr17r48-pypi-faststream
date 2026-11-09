@@ -1,0 +1,15 @@
+ARG PYTHON_VERSION=3.11
+
+FROM python:$PYTHON_VERSION
+COPY --from=ghcr.io/astral-sh/uv:0.9.30 /uv /uvx /bin/
+
+ENV PYTHONUNBUFFERED=1
+
+COPY ./pyproject.toml ./README.md ./LICENSE /src/
+COPY ./faststream/__init__.py /src/faststream/__init__.py
+
+WORKDIR /src
+
+RUN uv sync --group dev
+
+ENV PATH="/src/.venv/bin:$PATH"
